@@ -1,34 +1,68 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import path from 'node:path';
 
 const PORT = process.env.PORT || 3000;
-// REPLY_MODE:
-//   'auto'  … AIの回答をそのまま顧客へ返す（テスト用・今はこれ）
-//   'draft' … 顧客には受付返信のみ。AI下書きはログに出す（承認フローを足すまでの安全設定）
+// REPLY_MODE: 'auto' … AI回答を顧客へ返す / 'draft' … 受付返信のみ（承認フロー用）
 const REPLY_MODE = process.env.REPLY_MODE || 'auto';
 
-// 知識ファイルを起動時に読み込む
-// KNOWLEDGE_PATH が指定されていればそこから（＝VPS上の非公開ファイルをマウントして使う）
-let KNOWLEDGE = '';
-const KNOWLEDGE_PATH = process.env.KNOWLEDGE_PATH || new URL('./knowledge.md', import.meta.url);
+// 知識ファイルのパス（VPSマウントの非公開ファイル）
+const KNOWLEDGE_PATH = process.env.KNOWLEDGE_PATH || new URL('./knowledge.md', import.meta.url).pathname;
+// 会話の保存先（既存マウント配下＝VPSに永続化。追加マウント不要）
+const DATA_DIR = process.env.DATA_DIR || path.join(path.dirname(KNOWLEDGE_PATH), 'conversations');
 try {
-  KNOWLEDGE = fs.readFileSync(KNOWLEDGE_PATH, 'utf8');
-  console.log('knowledge loaded:', KNOWLEDGE.length, 'chars from', String(KNOWLEDGE_PATH));
-} catch {
-  console.warn('knowledge を読めませんでした（空で続行）', String(KNOWLEDGE_PATH));
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  console.log('conversation data dir:', DATA_DIR);
+} catch (e) {
+  console.warn('DATA_DIR 作成に失敗', e);
 }
 
-const SYSTEM_PROMPT = `あなたはLINEでの顧客対応アシスタントです。下の「知識」だけを根拠に、丁寧語で簡潔に日本語で返信してください。
+// ① 自動リロード：知識はメッセージごとに読み直す（編集したら再起動なしで反映）
+function readKnowledge() {
+  try {
+    return fs.readFileSync(KNOWLEDGE_PATH, 'utf8');
+  } catch {
+    console.warn('knowledge を読めませんでした', String(KNOWLEDGE_PATH));
+    return '';
+  }
+}
+
+function buildSystemPrompt() {
+  return `あなたはLINEでの顧客対応アシスタントです。下の「知識」だけを根拠に、丁寧語で簡潔に日本語で返信してください。
 
 ルール:
 - 知識に書かれていないことは断定せず「担当者が確認のうえご連絡します」と伝える。
 - 事実を作らない・盛らない。
 - 体験レッスンの案内やよくある質問に、知識の範囲で答える。
 - 相手を急かさず、押し付けない丁寧なトーンで。
+- LINEでは太字などの記号（**）は表示されないので使わない。
 
 # 知識
-${KNOWLEDGE}`;
+${readKnowledge()}`;
+}
+
+// ② 会話を人ごとに保存（JSONL）
+function logConversation(userId, displayName, direction, text) {
+  try {
+    const safe = String(userId).replace(/[^a-zA-Z0-9_-]/g, '_');
+    const rec = { ts: new Date().toISOString(), userId, displayName, direction, text };
+    fs.appendFileSync(path.join(DATA_DIR, `${safe}.jsonl`), JSON.stringify(rec) + '\n');
+  } catch (e) {
+    console.error('会話の保存に失敗', e);
+  }
+}
+
+// 顧客の表示名を取得（ベストエフォート）
+async function getDisplayName(userId) {
+  try {
+    const res = await fetch(`https://api.line.me/v2/bot/profile/${userId}`, {
+      headers: { Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}` },
+    });
+    if (res.ok) return (await res.json()).displayName || null;
+  } catch {}
+  return null;
+}
 
 // Claude(Haiku) で下書きを生成
 async function generateDraft(userText) {
@@ -40,15 +74,11 @@ async function generateDraft(userText) {
   try {
     const res = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
-      headers: {
-        'x-api-key': key,
-        'anthropic-version': '2023-06-01',
-        'content-type': 'application/json',
-      },
+      headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
       body: JSON.stringify({
         model: 'claude-haiku-4-5-20251001',
         max_tokens: 1024,
-        system: SYSTEM_PROMPT,
+        system: buildSystemPrompt(),
         messages: [{ role: 'user', content: userText }],
       }),
     });
@@ -56,15 +86,13 @@ async function generateDraft(userText) {
       console.error('Claude API error', res.status, await res.text());
       return null;
     }
-    const data = await res.json();
-    return data.content?.[0]?.text?.trim() || null;
+    return (await res.json()).content?.[0]?.text?.trim() || null;
   } catch (e) {
     console.error('Claude API 呼び出し失敗', e);
     return null;
   }
 }
 
-// 顧客への返信（LINE Reply API）
 async function replyToLine(replyToken, text) {
   await fetch('https://api.line.me/v2/bot/message/reply', {
     method: 'POST',
@@ -117,21 +145,18 @@ const server = http.createServer(async (req, res) => {
     events.map(async (event) => {
       if (event.type === 'message' && event.message.type === 'text') {
         const text = event.message.text;
-        console.log('incoming message:', text);
+        const userId = event.source?.userId || 'unknown';
+        const displayName = await getDisplayName(userId);
+        console.log(`incoming from ${displayName || userId}:`, text);
+        logConversation(userId, displayName, 'in', text);
 
         const draft = await generateDraft(text);
-        console.log('AI draft:', draft);
-
-        if (draft && REPLY_MODE === 'auto') {
-          // テスト用：AIの回答をそのまま返す
-          await replyToLine(event.replyToken, draft);
-        } else {
-          // draftモード or 生成失敗：受付返信のみ（AI回答は顧客に出さない）
-          await replyToLine(
-            event.replyToken,
-            '受け付けました。担当者が確認して返信しますので、少々お待ちください。'
-          );
-        }
+        const reply =
+          draft && REPLY_MODE === 'auto'
+            ? draft
+            : '受け付けました。担当者が確認して返信しますので、少々お待ちください。';
+        await replyToLine(event.replyToken, reply);
+        logConversation(userId, displayName, 'out', reply);
       }
     })
   );
