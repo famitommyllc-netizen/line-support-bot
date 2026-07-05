@@ -4,8 +4,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const PORT = process.env.PORT || 3000;
-// REPLY_MODE: 'auto' … AI回答を顧客へ返す / 'draft' … 受付返信のみ（承認フロー用）
-const REPLY_MODE = process.env.REPLY_MODE || 'auto';
+// REPLY_MODE:
+//   'notify' … 顧客には自動送信せず、運営者に「内容＋返信案」を通知（既定）
+//   'auto'   … AI回答を顧客へ直接返す
+const REPLY_MODE = process.env.REPLY_MODE || 'notify';
 
 // 知識ファイルのパス（VPSマウントの非公開ファイル）
 const KNOWLEDGE_PATH = process.env.KNOWLEDGE_PATH || new URL('./knowledge.md', import.meta.url).pathname;
@@ -19,6 +21,18 @@ try {
 } catch (e) {
   console.warn('DATA_DIR 作成に失敗', e);
 }
+
+// 運営者（あなた）のLINE userId。notifyモード時、ここへ「内容＋返信案」を通知する
+const OPERATOR_ID =
+  process.env.OPERATOR_USER_ID ||
+  (() => {
+    try {
+      return fs.readFileSync(path.join(path.dirname(KNOWLEDGE_PATH), 'operator.txt'), 'utf8').trim();
+    } catch {
+      return '';
+    }
+  })();
+console.log(`mode=${REPLY_MODE} operator=${OPERATOR_ID ? 'set' : 'MISSING'}`);
 
 // ① 自動リロード：知識はメッセージごとに読み直す（編集したら再起動なしで反映）
 function readKnowledge() {
@@ -147,6 +161,18 @@ async function replyToLine(replyToken, text) {
   });
 }
 
+// 特定ユーザーへ能動送信（push）。運営者への通知や、個別連絡に使う
+async function pushToLine(to, text) {
+  await fetch('https://api.line.me/v2/bot/message/push', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`,
+    },
+    body: JSON.stringify({ to, messages: [{ type: 'text', text }] }),
+  });
+}
+
 const server = http.createServer(async (req, res) => {
   if (req.method === 'GET') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -194,12 +220,20 @@ const server = http.createServer(async (req, res) => {
         logConversation(userId, displayName, 'in', text);
 
         const draft = await generateDraft(userId, text);
-        const reply =
-          draft && REPLY_MODE === 'auto'
-            ? draft
-            : '受け付けました。担当者が確認して返信しますので、少々お待ちください。';
-        await replyToLine(event.replyToken, reply);
-        logConversation(userId, displayName, 'out', reply);
+        logConversation(userId, displayName, 'draft', draft || '');
+
+        if (REPLY_MODE === 'auto') {
+          // 顧客へ直接返信
+          await replyToLine(event.replyToken, draft || '受け付けました。担当者が確認して返信します。');
+        } else if (OPERATOR_ID) {
+          // notify：顧客には送らず、運営者へ「内容＋返信案」を通知
+          const notif =
+            `${displayName || '顧客'}さんから届いています：\n「${text}」\n\n` +
+            `こう返そうと思いますが、いかがですか？\n———\n${draft || '(返信案の生成に失敗しました)'}`;
+          await pushToLine(OPERATOR_ID, notif);
+        } else {
+          console.warn('OPERATOR_ID 未設定のため通知できません');
+        }
       }
     })
   );
