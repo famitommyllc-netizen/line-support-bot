@@ -38,9 +38,39 @@ function readRules() {
   }
 }
 
+function loadHistory(userId, maxTurns = 20) {
+  try {
+    const safe = String(userId).replace(/[^a-zA-Z0-9_-]/g, '_');
+    const lines = fs
+      .readFileSync(path.join(DATA_DIR, `${safe}.jsonl`), 'utf8')
+      .trim()
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => JSON.parse(l));
+    let msgs = lines.slice(-maxTurns).map((l) => ({
+      role: l.direction === 'in' ? 'user' : 'assistant',
+      content: l.text,
+    }));
+    while (msgs.length && msgs[0].role === 'assistant') msgs.shift();
+    const merged = [];
+    for (const m of msgs) {
+      const last = merged[merged.length - 1];
+      if (last && last.role === m.role) last.content += '\n' + m.content;
+      else merged.push({ ...m });
+    }
+    return merged;
+  } catch {
+    return [];
+  }
+}
+
 function buildSystemPrompt() {
   const rules = readRules().trim();
+  const now = new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo', dateStyle: 'full', timeStyle: 'short' });
   return `あなたはLINEでの顧客対応アシスタントです。下の「知識」だけを根拠に、丁寧語で簡潔に日本語で返信してください。
+
+現在日時（日本時間）: ${now}
+※退会の最短時期などは、この現在日時と規約の期限ルールから計算して具体的に案内してください。
 
 基本ルール:
 - 知識に書かれていないことは断定せず「担当者が確認のうえご連絡します」と伝える。
@@ -75,13 +105,15 @@ async function getDisplayName(userId) {
   return null;
 }
 
-// Claude(Haiku) で下書きを生成
-async function generateDraft(userText) {
+// Claude(Haiku) で下書きを生成（過去の会話履歴を踏まえる）
+async function generateDraft(userId, userText) {
   const key = process.env.ANTHROPIC_API_KEY;
   if (!key) {
     console.warn('ANTHROPIC_API_KEY 未設定のため下書き生成をスキップ');
     return null;
   }
+  const history = loadHistory(userId);
+  const messages = history.length ? history : [{ role: 'user', content: userText }];
   try {
     const res = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -90,7 +122,7 @@ async function generateDraft(userText) {
         model: 'claude-haiku-4-5-20251001',
         max_tokens: 1024,
         system: buildSystemPrompt(),
-        messages: [{ role: 'user', content: userText }],
+        messages,
       }),
     });
     if (!res.ok) {
@@ -161,7 +193,7 @@ const server = http.createServer(async (req, res) => {
         console.log(`incoming from ${displayName || userId}:`, text);
         logConversation(userId, displayName, 'in', text);
 
-        const draft = await generateDraft(text);
+        const draft = await generateDraft(userId, text);
         const reply =
           draft && REPLY_MODE === 'auto'
             ? draft
