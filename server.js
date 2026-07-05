@@ -9,11 +9,14 @@ const PORT = process.env.PORT || 3000;
 const REPLY_MODE = process.env.REPLY_MODE || 'auto';
 
 // 知識ファイルを起動時に読み込む
+// KNOWLEDGE_PATH が指定されていればそこから（＝VPS上の非公開ファイルをマウントして使う）
 let KNOWLEDGE = '';
+const KNOWLEDGE_PATH = process.env.KNOWLEDGE_PATH || new URL('./knowledge.md', import.meta.url);
 try {
-  KNOWLEDGE = fs.readFileSync(new URL('./knowledge.md', import.meta.url), 'utf8');
+  KNOWLEDGE = fs.readFileSync(KNOWLEDGE_PATH, 'utf8');
+  console.log('knowledge loaded:', KNOWLEDGE.length, 'chars from', String(KNOWLEDGE_PATH));
 } catch {
-  console.warn('knowledge.md を読めませんでした（空で続行）');
+  console.warn('knowledge を読めませんでした（空で続行）', String(KNOWLEDGE_PATH));
 }
 
 const SYSTEM_PROMPT = `あなたはLINEでの顧客対応アシスタントです。下の「知識」だけを根拠に、丁寧語で簡潔に日本語で返信してください。
