@@ -103,24 +103,33 @@ async function pushToLine(to, text) {
   });
 }
 
-// 運営者への通知（[送信][却下]ボタン付き）
-async function notifyOperator(text, cid) {
+// 運営者への通知（メッセージ内に[送信][却下]ボタンを表示するFlexメッセージ）
+async function notifyOperator(cid, name, customerText, draft, heading) {
+  const body = [];
+  if (heading) body.push({ type: 'text', text: heading, weight: 'bold', size: 'sm', color: '#1DB446' });
+  body.push(
+    { type: 'text', text: `${name || '顧客'}さんから`, weight: 'bold', size: 'sm', color: '#888888' },
+    { type: 'text', text: `「${customerText}」`, wrap: true, size: 'sm' },
+    { type: 'separator', margin: 'md' },
+    { type: 'text', text: '返信案', weight: 'bold', size: 'sm', margin: 'md' },
+    { type: 'text', text: draft || '(返信案の生成に失敗しました)', wrap: true, size: 'sm' },
+    { type: 'text', text: '※修正したい時はこのトークに指示を送ってください', wrap: true, size: 'xxs', color: '#aaaaaa', margin: 'md' }
+  );
+  const bubble = {
+    type: 'bubble',
+    body: { type: 'box', layout: 'vertical', spacing: 'sm', contents: body },
+    footer: {
+      type: 'box', layout: 'horizontal', spacing: 'sm',
+      contents: [
+        { type: 'button', style: 'primary', color: '#1DB446', height: 'sm', action: { type: 'postback', label: '✅ 送信', data: `action=send&cid=${encodeURIComponent(cid)}`, displayText: '送信する' } },
+        { type: 'button', style: 'secondary', height: 'sm', action: { type: 'postback', label: '🗑 却下', data: `action=reject&cid=${encodeURIComponent(cid)}`, displayText: '却下' } },
+      ],
+    },
+  };
   await fetch('https://api.line.me/v2/bot/message/push', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}` },
-    body: JSON.stringify({
-      to: OPERATOR_ID,
-      messages: [{
-        type: 'text',
-        text,
-        quickReply: {
-          items: [
-            { type: 'action', action: { type: 'postback', label: '✅ 送信する', data: `action=send&cid=${encodeURIComponent(cid)}`, displayText: '送信する' } },
-            { type: 'action', action: { type: 'postback', label: '🗑 却下', data: `action=reject&cid=${encodeURIComponent(cid)}`, displayText: '却下' } },
-          ],
-        },
-      }],
-    }),
+    body: JSON.stringify({ to: OPERATOR_ID, messages: [{ type: 'flex', altText: `${name || '顧客'}さんから問い合わせ`, contents: bubble }] }),
   });
 }
 
@@ -186,7 +195,7 @@ async function handleEvent(event) {
       const revised = await reviseDraft(last, text);
       if (revised) {
         setPending(last.cid, { name: last.name, text: last.text, draft: revised });
-        await notifyOperator(`修正しました：\n———\n${revised}`, last.cid);
+        await notifyOperator(last.cid, last.name, last.text, revised, '修正しました');
       } else {
         await pushToLine(OPERATOR_ID, '修正案の生成に失敗しました。');
       }
@@ -206,8 +215,7 @@ async function handleEvent(event) {
     await replyToLine(event.replyToken, draft || '受け付けました。担当者が確認して返信します。');
   } else if (OPERATOR_ID) {
     setPending(userId, { name: displayName, text, draft });
-    const notif = `${displayName || '顧客'}さんから届いています：\n「${text}」\n\nこう返そうと思いますが、いかがですか？\n———\n${draft || '(返信案の生成に失敗しました)'}`;
-    await notifyOperator(notif, userId);
+    await notifyOperator(userId, displayName, text, draft, null);
   } else {
     console.warn('OPERATOR_ID 未設定のため通知できません');
   }
