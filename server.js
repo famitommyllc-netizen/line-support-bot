@@ -9,6 +9,8 @@ const REPLY_MODE = process.env.REPLY_MODE || 'auto';
 
 // 知識ファイルのパス（VPSマウントの非公開ファイル）
 const KNOWLEDGE_PATH = process.env.KNOWLEDGE_PATH || new URL('./knowledge.md', import.meta.url).pathname;
+// 回答ルール（挙動の指示。VPS上で編集・自動リロード）
+const RULES_PATH = process.env.RULES_PATH || path.join(path.dirname(KNOWLEDGE_PATH), 'rules.md');
 // 会話の保存先（既存マウント配下＝VPSに永続化。追加マウント不要）
 const DATA_DIR = process.env.DATA_DIR || path.join(path.dirname(KNOWLEDGE_PATH), 'conversations');
 try {
@@ -28,16 +30,25 @@ function readKnowledge() {
   }
 }
 
+function readRules() {
+  try {
+    return fs.readFileSync(RULES_PATH, 'utf8');
+  } catch {
+    return '';
+  }
+}
+
 function buildSystemPrompt() {
+  const rules = readRules().trim();
   return `あなたはLINEでの顧客対応アシスタントです。下の「知識」だけを根拠に、丁寧語で簡潔に日本語で返信してください。
 
-ルール:
+基本ルール:
 - 知識に書かれていないことは断定せず「担当者が確認のうえご連絡します」と伝える。
 - 事実を作らない・盛らない。
 - 体験レッスンの案内やよくある質問に、知識の範囲で答える。
 - 相手を急かさず、押し付けない丁寧なトーンで。
 - LINEでは太字などの記号（**）は表示されないので使わない。
-
+${rules ? `\n# 追加の回答ルール（運用者が定義）\n${rules}\n` : ''}
 # 知識
 ${readKnowledge()}`;
 }
