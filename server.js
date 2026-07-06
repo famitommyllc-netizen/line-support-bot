@@ -227,6 +227,7 @@ async function handleEvent(event) {
     // 管理メニュー
     const menu = params.get('menu');
     if (menu) {
+      console.log('[admin menu]', menu);
       if (menu === 'rules_view') await pushToLine(OPERATOR_ID, '【応答ルール】\n' + (readFileSafe(RULES_PATH).trim() || '(未設定)'));
       else if (menu === 'terms_view') await pushToLine(OPERATOR_ID, '【規約(知識)】\n' + (readFileSafe(KNOWLEDGE_PATH).slice(0, 4500) || '(未設定)'));
       else if (menu === 'rules_add') { setOpState({ mode: 'awaiting_rule' }); await pushToLine(OPERATOR_ID, '追加するルールを1つ送ってください。'); }
@@ -258,6 +259,7 @@ async function handleEvent(event) {
 
   // 運営者本人の発言
   if (userId === OPERATOR_ID) {
+    console.log('[operator]', JSON.stringify(text).slice(0, 80));
     const st = getOpState();
     // ルール追加の入力待ち
     if (st.mode === 'awaiting_rule') {
