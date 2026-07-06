@@ -182,13 +182,20 @@ async function sendAdminMenu() {
 function recentSummary() {
   try {
     const files = fs.readdirSync(DATA_DIR).filter((f) => f.endsWith('.jsonl'));
-    const items = files.map((f) => {
+    const recent = files
+      .map((f) => ({ f, t: fs.statSync(path.join(DATA_DIR, f)).mtimeMs }))
+      .sort((a, b) => b.t - a.t)
+      .slice(0, 8);
+    const pend = readPendings().pendings;
+    const blocks = recent.map(({ f }) => {
       const lines = fs.readFileSync(path.join(DATA_DIR, f), 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
       const name = lines.map((l) => l.displayName).filter(Boolean).pop() || 'ID:' + f.replace('.jsonl', '').slice(0, 6);
-      const last = lines[lines.length - 1];
-      return `${name}：${(last?.text || '').slice(0, 30)}`;
+      const cid = lines[0]?.userId;
+      const lastIn = [...lines].reverse().find((l) => l.direction === 'in');
+      const status = pend[cid] ? ' 【承認待ち】' : '';
+      return `▼${name}${status}\n顧客: ${(lastIn?.text || '(発言なし)').slice(0, 60)}`;
     });
-    return '【最近の応答】\n' + (items.slice(-10).join('\n') || '(なし)');
+    return '【最近のやり取り】\n\n' + (blocks.join('\n\n') || '(なし)');
   } catch { return '履歴がありません。'; }
 }
 
