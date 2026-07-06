@@ -10,6 +10,7 @@ const REPLY_MODE = process.env.REPLY_MODE || 'notify';
 const KNOWLEDGE_PATH = process.env.KNOWLEDGE_PATH || new URL('./knowledge.md', import.meta.url).pathname;
 const BASE_DIR = path.dirname(KNOWLEDGE_PATH);
 const RULES_PATH = process.env.RULES_PATH || path.join(BASE_DIR, 'rules.md');
+const MANUALS_DIR = process.env.MANUALS_DIR || path.join(BASE_DIR, 'manuals');
 const DATA_DIR = process.env.DATA_DIR || path.join(BASE_DIR, 'conversations');
 const PENDING_FILE = path.join(BASE_DIR, 'pending.json');
 try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch {}
@@ -23,8 +24,19 @@ console.log(`mode=${REPLY_MODE} operator=${OPERATOR_ID ? 'set' : 'MISSING'}`);
 // ---------- 知識・ルール ----------
 function readFileSafe(p) { try { return fs.readFileSync(p, 'utf8'); } catch { return ''; } }
 
+function readManuals() {
+  try {
+    return fs.readdirSync(MANUALS_DIR)
+      .filter((f) => f.endsWith('.md'))
+      .map((f) => readFileSafe(path.join(MANUALS_DIR, f)))
+      .join('\n\n---\n\n')
+      .trim();
+  } catch { return ''; }
+}
+
 function buildSystemPrompt() {
   const rules = readFileSafe(RULES_PATH).trim();
+  const manuals = readManuals();
   const now = new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo', dateStyle: 'full', timeStyle: 'short' });
   return `あなたはLINEでの顧客対応アシスタントです。下の「知識」だけを根拠に、丁寧語で簡潔に日本語で返信してください。
 
@@ -36,7 +48,7 @@ function buildSystemPrompt() {
 - 事実を作らない・盛らない。
 - 相手を急かさず、押し付けない丁寧なトーンで。
 - LINEでは太字などの記号（**）は表示されないので使わない。
-${rules ? `\n# 追加の回答ルール（運用者が定義）\n${rules}\n` : ''}
+${rules ? `\n# 追加の回答ルール（運用者が定義）\n${rules}\n` : ''}${manuals ? `\n# 対応マニュアル（退会・未払い等はこの決まりごとに沿って、状況・金額・期限を差し込んで綺麗に整形して返信案を作る）\n${manuals}\n` : ''}
 # 知識
 ${readFileSafe(KNOWLEDGE_PATH)}`;
 }
