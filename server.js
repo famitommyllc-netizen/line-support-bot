@@ -145,6 +145,53 @@ async function notifyOperator(cid, name, customerText, draft, heading) {
   });
 }
 
+// ---------- 運営者メニュー（管理操作） ----------
+const OP_STATE_FILE = path.join(BASE_DIR, 'operator-state.json');
+function getOpState() { try { return JSON.parse(fs.readFileSync(OP_STATE_FILE, 'utf8')); } catch { return {}; } }
+function setOpState(s) { try { fs.writeFileSync(OP_STATE_FILE, JSON.stringify(s)); } catch (e) { console.error('opstate保存失敗', e); } }
+
+function adminBtn(label, data) {
+  return { type: 'button', style: 'secondary', height: 'sm', action: { type: 'postback', label, data, displayText: label } };
+}
+
+async function pushFlex(to, altText, bubble) {
+  await fetch('https://api.line.me/v2/bot/message/push', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}` },
+    body: JSON.stringify({ to, messages: [{ type: 'flex', altText, contents: bubble }] }),
+  });
+}
+
+async function sendAdminMenu() {
+  const bubble = {
+    type: 'bubble',
+    body: { type: 'box', layout: 'vertical', contents: [{ type: 'text', text: '管理メニュー', weight: 'bold', size: 'md' }] },
+    footer: {
+      type: 'box', layout: 'vertical', spacing: 'sm',
+      contents: [
+        adminBtn('📋 応答ルールを見る', 'menu=rules_view'),
+        adminBtn('➕ ルールを追加', 'menu=rules_add'),
+        adminBtn('📖 規約を見る', 'menu=terms_view'),
+        adminBtn('🗒 最近の応答を見る', 'menu=recent'),
+      ],
+    },
+  };
+  await pushFlex(OPERATOR_ID, '管理メニュー', bubble);
+}
+
+function recentSummary() {
+  try {
+    const files = fs.readdirSync(DATA_DIR).filter((f) => f.endsWith('.jsonl'));
+    const items = files.map((f) => {
+      const lines = fs.readFileSync(path.join(DATA_DIR, f), 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+      const name = lines.map((l) => l.displayName).filter(Boolean).pop() || 'ID:' + f.replace('.jsonl', '').slice(0, 6);
+      const last = lines[lines.length - 1];
+      return `${name}：${(last?.text || '').slice(0, 30)}`;
+    });
+    return '【最近の応答】\n' + (items.slice(-10).join('\n') || '(なし)');
+  } catch { return '履歴がありません。'; }
+}
+
 // ---------- AI ----------
 async function callClaude(messages) {
   const key = process.env.ANTHROPIC_API_KEY;
@@ -177,6 +224,15 @@ async function handleEvent(event) {
   // ボタン（承認/却下）
   if (event.type === 'postback') {
     const params = new URLSearchParams(event.postback.data || '');
+    // 管理メニュー
+    const menu = params.get('menu');
+    if (menu) {
+      if (menu === 'rules_view') await pushToLine(OPERATOR_ID, '【応答ルール】\n' + (readFileSafe(RULES_PATH).trim() || '(未設定)'));
+      else if (menu === 'terms_view') await pushToLine(OPERATOR_ID, '【規約(知識)】\n' + (readFileSafe(KNOWLEDGE_PATH).slice(0, 4500) || '(未設定)'));
+      else if (menu === 'rules_add') { setOpState({ mode: 'awaiting_rule' }); await pushToLine(OPERATOR_ID, '追加するルールを1つ送ってください。'); }
+      else if (menu === 'recent') await pushToLine(OPERATOR_ID, recentSummary());
+      return;
+    }
     const action = params.get('action');
     const cid = params.get('cid');
     const pend = getPending(cid);
@@ -200,8 +256,19 @@ async function handleEvent(event) {
   const text = event.message.text;
   const userId = event.source?.userId || 'unknown';
 
-  // 運営者本人の発言＝保留中の下書きへの「修正指示」
+  // 運営者本人の発言
   if (userId === OPERATOR_ID) {
+    const st = getOpState();
+    // ルール追加の入力待ち
+    if (st.mode === 'awaiting_rule') {
+      try { fs.appendFileSync(RULES_PATH, '\n- ' + text.trim() + '\n'); } catch (e) { console.error(e); }
+      setOpState({});
+      await pushToLine(OPERATOR_ID, '応答ルールに追加しました。');
+      return;
+    }
+    // メニューを開く
+    if (text.trim() === 'メニュー') { await sendAdminMenu(); return; }
+    // 保留中の返信案があれば修正指示として扱う
     const last = getLastPending();
     if (last) {
       const revised = await reviseDraft(last, text);
@@ -211,7 +278,9 @@ async function handleEvent(event) {
       } else {
         await pushToLine(OPERATOR_ID, '修正案の生成に失敗しました。');
       }
+      return;
     }
+    await pushToLine(OPERATOR_ID, '「メニュー」と送ると管理メニューが開きます。');
     return;
   }
 
