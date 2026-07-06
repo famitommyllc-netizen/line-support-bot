@@ -131,10 +131,16 @@ async function notifyOperator(cid, name, customerText, draft, heading) {
     type: 'bubble',
     body: { type: 'box', layout: 'vertical', spacing: 'sm', contents: body },
     footer: {
-      type: 'box', layout: 'horizontal', spacing: 'sm',
+      type: 'box', layout: 'vertical', spacing: 'sm',
       contents: [
-        { type: 'button', style: 'primary', color: '#1DB446', height: 'sm', action: { type: 'postback', label: '✅ 送信', data: `action=send&cid=${encodeURIComponent(cid)}`, displayText: '送信する' } },
-        { type: 'button', style: 'secondary', height: 'sm', action: { type: 'postback', label: '🗑 却下', data: `action=reject&cid=${encodeURIComponent(cid)}`, displayText: '却下' } },
+        { type: 'box', layout: 'horizontal', spacing: 'sm', contents: [
+          { type: 'button', style: 'primary', color: '#1DB446', height: 'sm', action: { type: 'postback', label: '✅ 送信', data: `action=send&cid=${encodeURIComponent(cid)}`, displayText: '送信する' } },
+          { type: 'button', style: 'secondary', height: 'sm', action: { type: 'postback', label: '🗑 却下', data: `action=reject&cid=${encodeURIComponent(cid)}`, displayText: '却下' } },
+        ] },
+        { type: 'box', layout: 'horizontal', spacing: 'sm', contents: [
+          { type: 'button', style: 'secondary', height: 'sm', action: { type: 'postback', label: '✏️ AIで直す', data: `action=revise_ai&cid=${encodeURIComponent(cid)}`, displayText: 'AIで直す' } },
+          { type: 'button', style: 'secondary', height: 'sm', action: { type: 'postback', label: '✍️ 自分で書く', data: `action=revise_self&cid=${encodeURIComponent(cid)}`, displayText: '自分で書く' } },
+        ] },
       ],
     },
   };
@@ -256,6 +262,12 @@ async function handleEvent(event) {
     } else if (action === 'reject') {
       clearPending(cid);
       await pushToLine(OPERATOR_ID, '🗑 却下しました。');
+    } else if (action === 'revise_ai') {
+      setOpState({ mode: 'revise_ai', cid });
+      await pushToLine(OPERATOR_ID, 'どう直しますか？指示を送ってください（例：もっと丁寧に／料金を明記）。');
+    } else if (action === 'revise_self') {
+      setOpState({ mode: 'revise_self', cid });
+      await pushToLine(OPERATOR_ID, '送る文をそのまま送ってください。その全文がそのまま顧客に送信されます（コピペ・編集OK）。');
     }
     return;
   }
@@ -273,6 +285,28 @@ async function handleEvent(event) {
       try { fs.appendFileSync(RULES_PATH, '\n- ' + text.trim() + '\n'); } catch (e) { console.error(e); }
       setOpState({});
       await pushToLine(OPERATOR_ID, '応答ルールに追加しました。');
+      return;
+    }
+    // 「AIで直す」入力待ち：指示としてAIに作り直させる
+    if (st.mode === 'revise_ai' && st.cid) {
+      setOpState({});
+      const pend = getPending(st.cid);
+      if (pend) {
+        const revised = await reviseDraft({ name: pend.name, text: pend.text, draft: pend.draft }, text);
+        if (revised) { setPending(st.cid, { name: pend.name, text: pend.text, draft: revised }); await notifyOperator(st.cid, pend.name, pend.text, revised, '修正しました'); }
+        else await pushToLine(OPERATOR_ID, '修正案の生成に失敗しました。');
+      } else await pushToLine(OPERATOR_ID, '対象が見つかりませんでした。');
+      return;
+    }
+    // 「自分で書く」入力待ち：打った全文をそのまま顧客へ送信
+    if (st.mode === 'revise_self' && st.cid) {
+      setOpState({});
+      const pend = getPending(st.cid);
+      const name = pend ? pend.name : null;
+      await pushToLine(st.cid, text);
+      logConversation(st.cid, name, 'out', text);
+      clearPending(st.cid);
+      await pushToLine(OPERATOR_ID, `✅ ${name || '顧客'}さんへ送信しました。`);
       return;
     }
     // メニューを開く
