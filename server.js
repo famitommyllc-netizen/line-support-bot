@@ -533,6 +533,28 @@ function loadTermsSections(mode) {
     .map((s) => ({ title: s.split('\n')[0].replace(/^##\s*/, '').trim(), body: s }));
 }
 
+// 各項目が何についての取り決めかを、先に一言で伝えるための説明文。
+// 見出し名 → 説明 の対応は VPS 側の terms-guide.json に置く（実データはコードに持たない）。
+function loadTermsGuide() {
+  try { return JSON.parse(fs.readFileSync(path.join(BASE_DIR, 'terms-guide.json'), 'utf8')); } catch { return {}; }
+}
+
+// LINE では # や - がそのまま記号として見えてしまうため、読みやすい形に整える
+function formatTermsBody(body) {
+  return body
+    .split('\n')
+    .filter((l) => !/^##\s/.test(l)) // 見出しは別に出すので本文からは外す
+    .map((l) => {
+      if (/^###\s/.test(l)) return `\n■ ${l.replace(/^###\s*/, '').trim()}`;
+      const bullet = l.match(/^(\s*)[-*]\s+(.*)$/);
+      if (bullet) return `${bullet[1] ? '　' : ''}・${bullet[2].trim()}`;
+      return l;
+    })
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 // 複数メッセージを1回で送る（通知が何度も鳴らないように）
 async function pushMulti(to, messages) {
   await fetch('https://api.line.me/v2/bot/message/push', {
@@ -542,41 +564,33 @@ async function pushMulti(to, messages) {
   });
 }
 
-function onbBtn(label, data, primary = false) {
-  return {
-    type: 'button', height: 'sm',
-    style: primary ? 'primary' : 'secondary',
-    ...(primary ? { color: '#1DB446' } : {}),
-    action: { type: 'postback', label: String(label).slice(0, 20), data, displayText: String(label).slice(0, 20) },
-  };
+// 本文の下に出るボタン（クイックリプライ）。別メッセージにしないので通数が増えない
+function qr(label, data) {
+  const l = String(label).slice(0, 20);
+  return { type: 'action', action: { type: 'postback', label: l, data, displayText: l } };
 }
-function restartBtn() {
-  return { type: 'button', style: 'link', height: 'sm', action: { type: 'postback', label: '↩ 最初からやり直す', data: 'onb=restart', displayText: '最初からやり直す' } };
+function qrLink(label, uri) {
+  return { type: 'action', action: { type: 'uri', label: String(label).slice(0, 20), uri } };
 }
 
-// 本文（テキスト）＋ボタン（Flex）を1通で送る
-async function sendOnbStep(cid, displayName, text, buttons = [], altText = 'ご案内') {
-  const bubble = {
-    type: 'bubble',
-    body: { type: 'box', layout: 'vertical', contents: [{ type: 'text', text: '下のボタンから進んでください', size: 'xs', color: '#888888', wrap: true }] },
-    footer: { type: 'box', layout: 'vertical', spacing: 'sm', contents: [...buttons, restartBtn()] },
-  };
-  const messages = [];
-  if (text) messages.push({ type: 'text', text: String(text).slice(0, 4900) });
-  messages.push({ type: 'flex', altText: String(altText).slice(0, 380), contents: bubble });
-  await pushMulti(cid, messages);
-  if (text) logConversation(cid, displayName, 'out', text);
+// 1画面＝1通。ボタンは本文の下に添える
+async function sendOnbStep(cid, displayName, text, quickItems = []) {
+  const msg = { type: 'text', text: String(text).slice(0, 4900) };
+  if (quickItems.length) msg.quickReply = { items: quickItems };
+  await pushMulti(cid, [msg]);
+  logConversation(cid, displayName, 'out', text);
 }
 
 async function startOnboarding(cid, displayName) {
   setOnb(cid, { stage: 'mode', mode: null, profile: {}, profileIdx: 0, termsIdx: 0, checked: [], startedAt: new Date().toISOString() });
   const intro = [
-    `はじめまして。${SCHOOL_NAME}で案内を担当している、${BOT_NAME}です。`,
+    `はじめまして。${SCHOOL_NAME}でご案内を担当しております、${BOT_NAME}と申します。`,
     '',
-    'このLINEでは、レッスンの案内、入会の手続き、普段の連絡をしています。',
+    'こちらのLINEでは、レッスンのご案内、ご入会のお手続き、日ごろのご連絡を承っております。',
     '',
-    'これから、入会に必要なことを順番に聞いていきます。数分で終わります。',
-    '途中で入力を間違えたら、「最初からやり直す」を押せば最初に戻ります。',
+    'これより、ご入会に必要なことを順にお伺いいたします。3分ほどで終わりますので、お手すきの折にお進めください。',
+    '',
+    '途中で入力を誤られた場合は、「最初から」とお送りいただければ、いつでも初めからやり直せます。どうぞ気楽にお進みください。',
   ].join('\n');
   await pushToLine(cid, intro);
   logConversation(cid, displayName, 'out', intro);
@@ -585,7 +599,7 @@ async function startOnboarding(cid, displayName) {
 
 async function restartOnboarding(cid, displayName) {
   clearOnb(cid);
-  await pushToLine(cid, '最初からやり直します。');
+  await pushToLine(cid, 'かしこまりました。初めからご案内いたします。');
   await startOnboarding(cid, displayName);
 }
 
@@ -593,16 +607,17 @@ async function sendModePicker(cid, displayName) {
   await sendOnbStep(
     cid, displayName,
     [
-      'まず、レッスンの受け方を選んでください。',
+      'はじめに、レッスンの受け方をお選びください。',
       '',
       '🏫 教室に通う',
-      `　${STUDIO_PLACE}でレッスンを受けます。`,
+      `　${STUDIO_PLACE}にお越しいただき、レッスンを受けていただきます。`,
       '',
       '🚗 出張に来てほしい',
-      '　講師が指定の場所へうかがいます。月謝とは別に、出張費と場所代がかかります。',
+      '　講師がご指定の場所へうかがいます。お月謝とは別に、出張費と場所代を頂戴いたします。',
+      '',
+      '下のボタンからお選びください。',
     ].join('\n'),
-    [onbBtn('🏫 教室に通う', 'onb=mode&v=studio', true), onbBtn('🚗 出張に来てほしい', 'onb=mode&v=visit', true)],
-    'レッスンの受け方を選んでください',
+    [qr('🏫 教室に通う', 'onb=mode&v=studio'), qr('🚗 出張に来てほしい', 'onb=mode&v=visit')],
   );
 }
 
@@ -612,8 +627,13 @@ async function askNextProfile(cid, displayName) {
   const qs = questionsFor(st.mode);
   if (st.profileIdx >= qs.length) { await startTerms(cid, displayName); return; }
   const q = qs[st.profileIdx];
-  const text = `【${st.profileIdx + 1}/${qs.length}】${q.q}${q.hint ? `\n${q.hint}` : ''}\n\nこのまま返信してください。`;
-  await sendOnbStep(cid, displayName, text, [], q.q);
+  const text = [
+    `【${st.profileIdx + 1}／${qs.length}】${q.q}`,
+    ...(q.hint ? ['', q.hint] : []),
+    '',
+    'このままご返信ください。',
+  ].join('\n');
+  await sendOnbStep(cid, displayName, text);
 }
 
 async function acceptProfileAnswer(cid, displayName, text) {
@@ -625,19 +645,19 @@ async function acceptProfileAnswer(cid, displayName, text) {
   if (q.key === 'age') {
     const n = parseInt(String(text).replace(/[^0-9]/g, ''), 10);
     if (!Number.isFinite(n) || n <= 0 || n > 120) {
-      await pushToLine(cid, '年齢は数字で入力してください（例：34）。');
+      await pushToLine(cid, '恐れ入りますが、年齢は数字でご入力いただけますでしょうか（例：34）。');
       return;
     }
     if (n < MIN_AGE) {
       setOnb(cid, { ...st, stage: 'blocked' });
       const msg = [
-        'ありがとうございます。',
+        'お答えいただき、ありがとうございます。',
         '',
-        `${SCHOOL_NAME}は、${MIN_AGE}歳以上の方を対象にレッスンを行っています。`,
-        '大人としての自立を前提にした内容のため、今の方針では未成年の方はお受けしていません。',
+        `${SCHOOL_NAME}は、${MIN_AGE}歳以上の方を対象にレッスンを行っております。`,
+        '大人としての自立を前提とした内容のため、現在の方針では未成年の方はお受けしておりません。',
         '',
-        'ここまで答えていただいたのに、力になれず残念です。',
-        '聞きたいことがあれば、担当からあらためて連絡します。',
+        'ここまでお答えいただいたにもかかわらず、お力になれず心苦しく存じます。',
+        'ご不明な点がございましたら、担当よりあらためてご連絡いたします。',
       ].join('\n');
       await pushToLine(cid, msg);
       logConversation(cid, displayName, 'out', msg);
@@ -647,7 +667,7 @@ async function acceptProfileAnswer(cid, displayName, text) {
     st.profile[q.key] = String(n);
   } else if (q.key === 'email') {
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(text).trim())) {
-      await pushToLine(cid, 'メールアドレスの形式が正しくないようです。もう一度入力してください。');
+      await pushToLine(cid, 'メールアドレスの形式が異なるようでございます。お手数ですが、もう一度ご入力ください。');
       return;
     }
     st.profile[q.key] = String(text).trim();
@@ -663,19 +683,21 @@ async function startTerms(cid, displayName) {
   const st = getOnb(cid);
   const sections = loadTermsSections(st.mode);
   if (!sections.length) {
-    await pushToLine(cid, 'ここまでありがとうございます。規約の説明と手続きの案内は、担当からあらためて連絡します。少し待ってください。');
+    await pushToLine(cid, 'ここまでご協力いただき、ありがとうございます。規約のご案内とお手続きにつきましては、担当よりあらためてご連絡いたします。いましばらくお待ちください。');
     if (OPERATOR_ID) await pushToLine(OPERATOR_ID, `【要対応】規約ファイルが読み込めず、${displayName || cid} さんの規約説明を開始できませんでした（${st.mode === 'visit' ? 'knowledge-visit.md' : 'knowledge.md'} を確認してください）。`);
     setOnb(cid, { ...st, stage: 'blocked' });
     return;
   }
-  setOnb(cid, { ...st, stage: 'terms', termsIdx: 0 });
+  setOnb(cid, { ...st, stage: 'terms', termsIdx: 0, checked: [] });
   const head = [
-    'ありがとうございます。ここからは規約の説明です。',
+    'ありがとうございます。',
     '',
-    `${courseLabel(st.mode)}の規約を、順番に見ていきます。全部で${sections.length}項目です。`,
-    '1つずつ読んで、「次へ」を押してください。',
+    `ここからは、${courseLabel(st.mode)}の規約をご案内いたします。全部で${sections.length}項目ございます。`,
     '',
-    'あとで食い違いが起きないよう、読み飛ばさずに確認してください。',
+    '1項目ずつお送りいたしますので、お読みいただいたうえで「確認しました」をお押しください。',
+    'それぞれ、何についての取り決めかを冒頭に添えております。',
+    '',
+    'のちのち行き違いが生じないよう、お手数ですがお目通しをお願いいたします。',
   ].join('\n');
   await pushToLine(cid, head);
   logConversation(cid, displayName, 'out', head);
@@ -686,60 +708,32 @@ async function sendTermsSection(cid, displayName) {
   const st = getOnb(cid);
   const sections = loadTermsSections(st.mode);
   const sec = sections[st.termsIdx];
-  if (!sec) { await startCheck(cid, displayName); return; }
+  if (!sec) { await startQa(cid, displayName); return; }
   const isLast = st.termsIdx >= sections.length - 1;
-  const text = `【${st.termsIdx + 1}/${sections.length}】\n\n${sec.body}`;
-  await sendOnbStep(cid, displayName, text, [onbBtn(isLast ? '確認へ進む' : '次へ', 'onb=next', true)], `規約 ${st.termsIdx + 1}/${sections.length} ${sec.title}`);
-}
-
-async function startCheck(cid, displayName) {
-  const st = getOnb(cid);
-  setOnb(cid, { ...st, stage: 'check', checked: [] });
-  const head = [
-    '規約の説明は以上です。',
+  const guide = loadTermsGuide()[sec.title] || '';
+  const text = [
+    `【${st.termsIdx + 1}／${sections.length}】${sec.title}`,
     '',
-    '最後に確認です。下の項目を1つずつ押して、チェックを入れてください。',
-    'すべてにチェックが入ると、同意のボタンが出ます。',
+    ...(guide ? [guide, ''] : []),
+    '─────────',
     '',
-    '納得できない点があれば、同意せずに聞いてください。',
+    formatTermsBody(sec.body),
   ].join('\n');
-  await pushToLine(cid, head);
-  logConversation(cid, displayName, 'out', head);
-  await sendCheckList(cid);
-}
-
-async function sendCheckList(cid) {
-  const st = getOnb(cid);
-  const sections = loadTermsSections(st.mode);
-  const checked = st.checked || [];
-  const rows = sections.map((s, i) => onbBtn(`${checked.includes(i) ? '✅' : '⬜'} ${s.title}`, `onb=chk&i=${i}`));
-  const allDone = sections.length > 0 && checked.length === sections.length;
-  if (allDone) rows.push(onbBtn('✍️ 上記すべてに同意します', 'onb=agree', true));
-  rows.push(restartBtn());
-  const bubble = {
-    type: 'bubble',
-    body: { type: 'box', layout: 'vertical', spacing: 'sm', contents: [
-      { type: 'text', text: '規約の確認', weight: 'bold', size: 'md' },
-      { type: 'text', text: `${checked.length} / ${sections.length} 項目を確認しました`, size: 'sm', color: allDone ? '#1DB446' : '#888888', wrap: true },
-      { type: 'text', text: '押すたびにチェックが入ります（もう一度押すと外れます）', size: 'xxs', color: '#aaaaaa', wrap: true },
-    ] },
-    footer: { type: 'box', layout: 'vertical', spacing: 'sm', contents: rows },
-  };
-  await pushFlex(cid, `規約の確認 ${checked.length}/${sections.length}`, bubble);
+  await sendOnbStep(cid, displayName, text, [qr(isLast ? '内容に同意して進む' : '確認しました', 'onb=next')]);
 }
 
 async function startQa(cid, displayName) {
   const st = getOnb(cid);
   setOnb(cid, { ...st, stage: 'qa' });
   const text = [
-    '同意ありがとうございます。',
+    '最後までご確認いただき、ありがとうございます。',
     '',
-    '規約について、わからないことや気になることはありますか。',
-    'このまま送ってもらえれば答えます。',
+    '規約について、ご不明な点や気になることはございませんでしょうか。',
+    'このままメッセージをお送りいただければ、お答えいたします。',
     '',
-    '特になければ、下のボタンを押してください。',
+    '特にないようでしたら、下のボタンをお押しください。',
   ].join('\n');
-  await sendOnbStep(cid, displayName, text, [onbBtn('質問はありません', 'onb=noq', true)], '規約についてご質問はありますか');
+  await sendOnbStep(cid, displayName, text, [qr('質問はありません', 'onb=noq')]);
 }
 
 async function answerTermsQuestion(cid, displayName, text) {
@@ -753,8 +747,8 @@ async function answerTermsQuestion(cid, displayName, text) {
 
 質問：${text}`,
   }]);
-  const body = ans || 'この点は担当が確認して、あらためて連絡します。';
-  await sendOnbStep(cid, displayName, body, [onbBtn('質問はありません', 'onb=noq', true)], 'ご質問へのお答え');
+  const body = ans || 'こちらの点は担当が確認のうえ、あらためてご連絡いたします。';
+  await sendOnbStep(cid, displayName, body, [qr('質問はありません', 'onb=noq')]);
   if (!ans && OPERATOR_ID) await pushToLine(OPERATOR_ID, `【要対応】${displayName || cid} さんの規約質問に自動回答できませんでした。\n質問：${text}`);
 }
 
@@ -762,51 +756,47 @@ async function startContract(cid, displayName) {
   const st = getOnb(cid);
   const total = FEE_ENROLL + FEE_MONTHLY;
   const hasFees = FEE_ENROLL > 0 && FEE_MONTHLY > 0;
-  const lines = ['ありがとうございます。手続きの案内です。', ''];
+  const lines = ['ご確認いただき、ありがとうございました。', '', 'お手続きについてご案内いたします。', ''];
   if (hasFees) {
     lines.push(
       `【${courseLabel(st.mode)}／初回のお支払い】（税込）`,
+      '',
       `・入会金　　　　${FEE_ENROLL.toLocaleString()}円`,
       `・初月のお月謝　${FEE_MONTHLY.toLocaleString()}円`,
+      '─────────',
       `・合計　　　　　${total.toLocaleString()}円`,
     );
   } else {
-    // 料金の設定が読めなかった場合。誤った金額を伝えるより、担当に引き継ぐ
-    lines.push('初回の支払いについては、担当からあらためて案内します。');
+    // 料金の設定が読めなかった場合。誤った金額をお伝えするより、担当に引き継ぐ
+    lines.push('初回のお支払いにつきましては、担当よりあらためてご案内いたします。');
     console.warn('料金設定が読み込めていません（settings.json を確認してください）');
   }
   if (st.mode === 'visit') {
     lines.push(
       '',
       FEE_VISIT > 0
-        ? `※ 出張費（訪問1回につき${FEE_VISIT.toLocaleString()}円）と、出張先の場所代は上記に含まれません。`
-        : '※ 出張費と、出張先の場所代は別途かかります。',
-      '初回レッスンの日程が決まったら、あらためて案内します。',
+        ? `※ 出張費（訪問1回につき${FEE_VISIT.toLocaleString()}円）と、出張先の場所代は上記に含まれておりません。`
+        : '※ 出張費と、出張先の場所代は別途頂戴いたします。',
+      '　初回レッスンの日程が決まりましたら、あらためてご案内いたします。',
     );
   }
-  lines.push('', '支払いは、本人名義のクレジットカードでお願いします。');
+  lines.push('', 'お支払いは、ご本人名義のクレジットカードでお願いいたします。');
 
-  const buttons = [];
   if (PAYMENT_LINK_URL) {
-    lines.push('下のボタンから手続きに進んでください。');
-    buttons.push({ type: 'button', style: 'primary', color: '#1DB446', height: 'sm', action: { type: 'uri', label: '💳 お支払いに進む', uri: PAYMENT_LINK_URL } });
+    lines.push('', '下のボタンより、お手続きにお進みください。');
   } else {
     lines.push(
       '',
-      '【支払いの手続きについて】',
-      'ただいま、オンラインで支払いができる仕組みを準備しています。',
-      '整い次第、このLINEで案内しますので、もう少し待ってください。',
+      '─────────',
+      '🚧 お支払いのお手続きについて',
+      '',
+      'ただいま、オンラインでお支払いいただける仕組みをご用意しております。',
+      '整い次第、こちらのLINEでご案内いたしますので、いましばらくお待ちいただけますと幸いです。',
     );
   }
 
   const text = lines.join('\n');
-  const bubble = {
-    type: 'bubble',
-    body: { type: 'box', layout: 'vertical', contents: [{ type: 'text', text: PAYMENT_LINK_URL ? '手続きの案内' : '🚧 支払いの手続きは準備中です', weight: 'bold', size: 'md', wrap: true }] },
-    footer: { type: 'box', layout: 'vertical', spacing: 'sm', contents: buttons.length ? buttons : [{ type: 'text', text: '整い次第、このLINEで案内します。', size: 'sm', wrap: true }] },
-  };
-  await pushMulti(cid, [{ type: 'text', text }, { type: 'flex', altText: 'お手続きのご案内', contents: bubble }]);
-  logConversation(cid, displayName, 'out', text);
+  await sendOnbStep(cid, displayName, text, PAYMENT_LINK_URL ? [qrLink('💳 お支払いに進む', PAYMENT_LINK_URL)] : []);
 
   const sections = loadTermsSections(st.mode);
   saveStudent(cid, {
@@ -859,7 +849,7 @@ async function handleOnbPostback(cid, displayName, onb, params) {
   if (onb === 'mode') {
     const v = params.get('v') === 'visit' ? 'visit' : 'studio';
     setOnb(cid, { ...st, mode: v, stage: 'profile', profileIdx: 0, profile: {} });
-    const msg = `${courseLabel(v)}ですね。\nそれでは、いくつか聞かせてください。`;
+    const msg = `${courseLabel(v)}でございますね。かしこまりました。\n\nそれでは、いくつかお伺いいたします。`;
     await pushToLine(cid, msg);
     logConversation(cid, displayName, 'out', msg);
     await askNextProfile(cid, displayName);
@@ -867,26 +857,14 @@ async function handleOnbPostback(cid, displayName, onb, params) {
   }
   if (onb === 'next') {
     if (st.stage !== 'terms') return;
-    setOnb(cid, { ...st, termsIdx: st.termsIdx + 1 });
-    await sendTermsSection(cid, displayName);
-    return;
-  }
-  if (onb === 'chk') {
-    if (st.stage !== 'check') return;
-    const i = parseInt(params.get('i'), 10);
-    if (!Number.isFinite(i)) return;
-    const checked = st.checked || [];
-    const at = checked.indexOf(i);
-    if (at >= 0) checked.splice(at, 1); else checked.push(i);
-    setOnb(cid, { ...st, checked });
-    await sendCheckList(cid);
-    return;
-  }
-  if (onb === 'agree') {
-    if (st.stage !== 'check') return;
     const sections = loadTermsSections(st.mode);
-    if ((st.checked || []).length !== sections.length) { await sendCheckList(cid); return; }
-    await startQa(cid, displayName);
+    // 「確認しました」を押した項目を記録していく（これが同意の記録になる）
+    const checked = st.checked || [];
+    if (!checked.includes(st.termsIdx)) checked.push(st.termsIdx);
+    const nextIdx = st.termsIdx + 1;
+    setOnb(cid, { ...st, termsIdx: nextIdx, checked });
+    if (nextIdx >= sections.length) { await startQa(cid, displayName); return; }
+    await sendTermsSection(cid, displayName);
     return;
   }
   if (onb === 'noq') {
@@ -908,7 +886,7 @@ async function handleOnbText(cid, displayName, text) {
     // 案内を止めた相手。運営者が引き取るので、通常の承認フローへ戻す
     return;
   }
-  await pushToLine(cid, '下のボタンから進んでください。\n最初からやり直したいときは「最初から」と送ってください。');
+  await pushToLine(cid, '恐れ入ります。下のボタンからお進みください。\n初めからやり直される場合は、「最初から」とお送りください。');
 }
 
 // ---------- イベント処理 ----------
