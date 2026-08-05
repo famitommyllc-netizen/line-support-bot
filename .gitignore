@@ -1,3 +1,6 @@
 .env
 node_modules/
 .DS_Store
+
+# 事業ごとの実データ（教室名・講師名・料金・場所）。VPS側にのみ置く
+settings.json
