@@ -783,7 +783,9 @@ async function answerTermsQuestion(cid, displayName, text) {
 
 async function startContract(cid, displayName) {
   const st = getOnb(cid);
-  const total = FEE_ENROLL + FEE_MONTHLY;
+  // 出張費は月額。訪問の回数では変わらないので、初月分を初回のお支払いに含める
+  const visitFee = st.mode === 'visit' ? FEE_VISIT : 0;
+  const total = FEE_ENROLL + FEE_MONTHLY + visitFee;
   const hasFees = FEE_ENROLL > 0 && FEE_MONTHLY > 0;
   const lines = ['ご確認いただき、ありがとうございました。', '', 'お手続きについてご案内いたします。', ''];
   if (hasFees) {
@@ -792,6 +794,7 @@ async function startContract(cid, displayName) {
       '',
       `・入会金　　　　${FEE_ENROLL.toLocaleString()}円`,
       `・初月のお月謝　${FEE_MONTHLY.toLocaleString()}円`,
+      ...(visitFee > 0 ? [`・初月の出張費　${visitFee.toLocaleString()}円`] : []),
       '─────────',
       `・合計　　　　　${total.toLocaleString()}円`,
     );
@@ -803,10 +806,13 @@ async function startContract(cid, displayName) {
   if (st.mode === 'visit') {
     lines.push(
       '',
-      FEE_VISIT > 0
-        ? `※ 出張費（訪問1回につき${FEE_VISIT.toLocaleString()}円）と、出張先の場所代は上記に含まれておりません。`
-        : '※ 出張費と、出張先の場所代は別途頂戴いたします。',
-      '　初回レッスンの日程が決まりましたら、あらためてご案内いたします。',
+      ...(visitFee > 0
+        ? [
+            `※ 出張費は月額${visitFee.toLocaleString()}円で、訪問の回数にかかわらず一律です。`,
+            '　レッスンの組み方が月によって変わっても、金額は変わりません。',
+          ]
+        : ['※ 出張費は別途頂戴いたします。']),
+      '※ 出張先の場所代は上記に含まれておりません。実際にかかった分をご負担いただきます。',
     );
   }
   lines.push('', 'お支払いは、ご本人名義のクレジットカードでお願いいたします。');
