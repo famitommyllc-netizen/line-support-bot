@@ -68,7 +68,7 @@ function readManuals() {
 function buildSystemPrompt() {
   const rules = readFileSafe(RULES_PATH).trim();
   const manuals = readManuals();
-  const visit = readFileSafe(KNOWLEDGE_VISIT_PATH).trim();
+  const visit = applyPageUrls(readFileSafe(KNOWLEDGE_VISIT_PATH)).trim();
   const now = new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo', dateStyle: 'full', timeStyle: 'short' });
   return `あなたはLINEでの顧客対応アシスタントです。下の「知識」だけを根拠に、丁寧語で簡潔に日本語で返信してください。
 
@@ -514,7 +514,14 @@ const PROFILE_QUESTIONS = [
   { key: 'kana', q: 'お名前のフリガナを教えてください。', hint: '例：ヤマダ タロウ' },
   { key: 'age', q: '年齢を教えてください。', hint: '数字だけでかまいません（例：34）' },
   { key: 'email', q: 'メールアドレスを教えてください。', hint: '手続きや、大切な連絡に使います' },
-  { key: 'phone', q: 'お電話番号を教えてください。', hint: '当日の待ち合わせや、遅れるときの連絡に使います', visitOnly: true },
+  {
+    key: 'phone',
+    q: 'お電話番号を教えてください。',
+    hint: '当日の待ち合わせや、遅れる際のご連絡に使用いたします。\nLINEでお伝えしにくい場合は、下のボタンをお押しください。',
+    visitOnly: true,
+    altLabel: '口頭でお伝えします',
+    altValue: '（初回レッスン時に口頭でお伺いする）',
+  },
   { key: 'instrument', q: 'ご希望の楽器を教えてください。', hint: '例：ドラム' },
   { key: 'experience', q: '楽器のご経験を教えてください。', hint: '例：初めてです／3年ほど' },
   { key: 'goal', q: 'レッスンで叶えたいことを教えてください。', hint: '例：好きな曲を叩けるようになりたい' },
@@ -522,9 +529,30 @@ const PROFILE_QUESTIONS = [
 function questionsFor(mode) { return PROFILE_QUESTIONS.filter((q) => !q.visitOnly || mode === 'visit'); }
 function courseLabel(mode) { return mode === 'visit' ? '出張レッスンコース' : '教室に通うコース'; }
 
+// 規約中の {{PRIVACY_URL}} / {{TERMS_URL}} を、settings.json のURLに差し替える。
+// URLが未設定のときは、その案内行ごと削る（リンクの無い「こちらのページ」を出さないため）。
+function applyPageUrls(text) {
+  let privacy = '';
+  let terms = '';
+  try {
+    const s = JSON.parse(fs.readFileSync(path.join(BASE_DIR, 'settings.json'), 'utf8'));
+    privacy = s.privacyPageUrl || '';
+    terms = s.termsPageUrl || '';
+  } catch {}
+  return text
+    .split('\n')
+    .map((l) => {
+      if (l.includes('{{PRIVACY_URL}}')) return privacy ? l.replace('{{PRIVACY_URL}}', privacy) : null;
+      if (l.includes('{{TERMS_URL}}')) return terms ? l.replace('{{TERMS_URL}}', terms) : null;
+      return l;
+    })
+    .filter((l) => l !== null)
+    .join('\n');
+}
+
 // 規約を「## 見出し」ごとの配列にする。原文のまま説明する（要約で規約が歪むのを防ぐ）
 function loadTermsSections(mode) {
-  const raw = readFileSafe(mode === 'visit' ? KNOWLEDGE_VISIT_PATH : KNOWLEDGE_PATH);
+  const raw = applyPageUrls(readFileSafe(mode === 'visit' ? KNOWLEDGE_VISIT_PATH : KNOWLEDGE_PATH));
   if (!raw.trim()) return [];
   return raw
     .split(/\n(?=##\s)/)
@@ -633,7 +661,8 @@ async function askNextProfile(cid, displayName) {
     '',
     'このままご返信ください。',
   ].join('\n');
-  await sendOnbStep(cid, displayName, text);
+  // 「口頭でお伝えします」のように、入力せずに進める選択肢がある質問だけボタンを出す
+  await sendOnbStep(cid, displayName, text, q.altLabel ? [qr(q.altLabel, 'onb=alt')] : []);
 }
 
 async function acceptProfileAnswer(cid, displayName, text) {
@@ -850,6 +879,20 @@ async function handleOnbPostback(cid, displayName, onb, params) {
     const v = params.get('v') === 'visit' ? 'visit' : 'studio';
     setOnb(cid, { ...st, mode: v, stage: 'profile', profileIdx: 0, profile: {} });
     const msg = `${courseLabel(v)}でございますね。かしこまりました。\n\nそれでは、いくつかお伺いいたします。`;
+    await pushToLine(cid, msg);
+    logConversation(cid, displayName, 'out', msg);
+    await askNextProfile(cid, displayName);
+    return;
+  }
+  // 入力の代わりに用意した選択肢（例：電話番号を口頭でお伝えする）
+  if (onb === 'alt') {
+    if (st.stage !== 'profile') return;
+    const qs = questionsFor(st.mode);
+    const q = qs[st.profileIdx];
+    if (!q || !q.altValue) return;
+    st.profile[q.key] = q.altValue;
+    setOnb(cid, { ...st, profileIdx: st.profileIdx + 1 });
+    const msg = 'かしこまりました。初回レッスンの際に、直接お伺いいたします。';
     await pushToLine(cid, msg);
     logConversation(cid, displayName, 'out', msg);
     await askNextProfile(cid, displayName);
