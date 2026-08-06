@@ -30,14 +30,11 @@ const SETTINGS = (() => {
 const SCHOOL_NAME = process.env.SCHOOL_NAME || SETTINGS.schoolName || '当教室';
 // 案内役の名前。お客様扱いはせず、真摯・誠実・丁寧に、へりくだりすぎない言葉遣いで話す
 const BOT_NAME = process.env.BOT_NAME || SETTINGS.botName || '案内係';
-// レッスン場所の呼び方（例：「◯◯教室」）
-const STUDIO_PLACE = process.env.STUDIO_PLACE || SETTINGS.studioPlace || '教室';
 // 支払いリンク（Stripe の Payment Link を事前に作って URL を渡す）
 const PAYMENT_LINK_URL = process.env.PAYMENT_LINK_URL || SETTINGS.paymentLinkUrl || '';
-// 料金（税込）。0 のときは金額を出さず、担当から案内する扱いにする
+// 入会金（税込）。0 のときは金額を出さず、担当から案内する扱いにする。
+// コースごとの受講料は settings.json の courses 側に持つ
 const FEE_ENROLL = Number(process.env.FEE_ENROLL || SETTINGS.feeEnroll || 0);
-const FEE_MONTHLY = Number(process.env.FEE_MONTHLY || SETTINGS.feeMonthly || 0);
-const FEE_VISIT = Number(process.env.FEE_VISIT || SETTINGS.feeVisit || 0);
 const MIN_AGE = Number(process.env.MIN_AGE || SETTINGS.minAge || 20);
 
 // Gカレンダー登録（GAS経由）。GASのウェブアプリURLとtokenをenvで渡す
@@ -526,8 +523,24 @@ const PROFILE_QUESTIONS = [
   { key: 'experience', q: '楽器のご経験を教えてください。', hint: '例：初めてです／3年ほど' },
   { key: 'goal', q: 'レッスンで叶えたいことを教えてください。', hint: '例：好きな曲を叩けるようになりたい' },
 ];
-function questionsFor(mode) { return PROFILE_QUESTIONS.filter((q) => !q.visitOnly || mode === 'visit'); }
-function courseLabel(mode) { return mode === 'visit' ? '出張レッスンコース' : '教室に通うコース'; }
+// コースの定義は VPS 側の settings.json に置く（実データをコードに持たないため）
+function loadCourses() {
+  try {
+    const s = JSON.parse(fs.readFileSync(path.join(BASE_DIR, 'settings.json'), 'utf8'));
+    return Array.isArray(s.courses) ? s.courses.filter((c) => c && c.key) : [];
+  } catch { return []; }
+}
+function loadYearlyPerk() {
+  try {
+    const s = JSON.parse(fs.readFileSync(path.join(BASE_DIR, 'settings.json'), 'utf8'));
+    return s.yearlyPerk || '';
+  } catch { return ''; }
+}
+function findCourse(key) { return loadCourses().find((c) => c.key === key) || null; }
+function courseLabel(key) { const c = findCourse(key); return c ? c.name : 'レッスン'; }
+// 規約は「教室用」「出張用」の2種類。どちらを使うコースかを返す
+function courseTermsKind(key) { const c = findCourse(key); return c && c.terms === 'visit' ? 'visit' : 'studio'; }
+function questionsFor(key) { return PROFILE_QUESTIONS.filter((q) => !q.visitOnly || courseTermsKind(key) === 'visit'); }
 
 // 規約中の {{PRIVACY_URL}} / {{TERMS_URL}} を、settings.json のURLに差し替える。
 // URLが未設定のときは、その案内行ごと削る（リンクの無い「こちらのページ」を出さないため）。
@@ -552,7 +565,7 @@ function applyPageUrls(text) {
 
 // 規約を「## 見出し」ごとの配列にする。原文のまま説明する（要約で規約が歪むのを防ぐ）
 function loadTermsSections(mode) {
-  const raw = applyPageUrls(readFileSafe(mode === 'visit' ? KNOWLEDGE_VISIT_PATH : KNOWLEDGE_PATH));
+  const raw = applyPageUrls(readFileSafe(courseTermsKind(mode) === 'visit' ? KNOWLEDGE_VISIT_PATH : KNOWLEDGE_PATH));
   if (!raw.trim()) return [];
   return raw
     .split(/\n(?=##\s)/)
@@ -632,21 +645,48 @@ async function restartOnboarding(cid, displayName) {
 }
 
 async function sendModePicker(cid, displayName) {
-  await sendOnbStep(
-    cid, displayName,
-    [
-      'はじめに、レッスンの受け方をお選びください。',
-      '',
-      '🏫 教室に通う',
-      `　${STUDIO_PLACE}にお越しいただき、レッスンを受けていただきます。`,
-      '',
-      '🚗 出張に来てほしい',
-      '　講師がご指定の場所へうかがいます。お月謝とは別に、出張費と場所代を頂戴いたします。',
-      '',
-      '下のボタンからお選びください。',
-    ].join('\n'),
-    [qr('🏫 教室に通う', 'onb=mode&v=studio'), qr('🚗 出張に来てほしい', 'onb=mode&v=visit')],
-  );
+  const courses = loadCourses();
+  if (!courses.length) {
+    await pushToLine(cid, 'ただいまご案内の準備をしております。担当よりあらためてご連絡いたします。');
+    if (OPERATOR_ID) await pushToLine(OPERATOR_ID, `【要対応】コース設定が読み込めません（settings.json の courses を確認してください）。${displayName || cid} さんの案内を開始できませんでした。`);
+    return;
+  }
+  const lines = ['はじめに、コースをお選びください。', ''];
+  for (const c of courses) {
+    const price = c.yearlyOnly
+      ? `${Number(c.yearly || 0).toLocaleString()}円／年`
+      : `${Number(c.monthly || 0).toLocaleString()}円／月`;
+    lines.push(`■ ${c.name}　${price}`);
+    if (c.summary) lines.push(`　${c.summary}`);
+    lines.push('');
+  }
+  lines.push('下のボタンからお選びください。');
+  await sendOnbStep(cid, displayName, lines.join('\n'), courses.map((c) => qr(c.name, `onb=mode&v=${encodeURIComponent(c.key)}`)));
+}
+
+// お支払い方法（月々／年間まとめて）。年間まとめてを選ぶとライブが1回付く
+async function sendPayPicker(cid, displayName) {
+  const st = getOnb(cid);
+  const c = findCourse(st.mode);
+  if (!c) return;
+  const perk = loadYearlyPerk();
+  const lines = [
+    'お支払い方法をお選びください。',
+    '',
+    '■ 月々のお支払い',
+    `　${Number(c.monthly || 0).toLocaleString()}円／月`,
+    '',
+    '■ 年間まとめてのお支払い',
+    `　${Number(c.yearly || 0).toLocaleString()}円／年`,
+    ...(perk && !c.noPerk ? [`　${perk}`] : []),
+    '',
+    '年間まとめてのお支払いでも、金額の割引はいたしておりません。',
+    '講師の技術に対する対価は変えるべきではないと考えているためです。',
+  ];
+  await sendOnbStep(cid, displayName, lines.join('\n'), [
+    qr('月々のお支払い', 'onb=pay&v=monthly'),
+    qr('年間まとめて', 'onb=pay&v=yearly'),
+  ]);
 }
 
 async function askNextProfile(cid, displayName) {
@@ -713,7 +753,7 @@ async function startTerms(cid, displayName) {
   const sections = loadTermsSections(st.mode);
   if (!sections.length) {
     await pushToLine(cid, 'ここまでご協力いただき、ありがとうございます。規約のご案内とお手続きにつきましては、担当よりあらためてご連絡いたします。いましばらくお待ちください。');
-    if (OPERATOR_ID) await pushToLine(OPERATOR_ID, `【要対応】規約ファイルが読み込めず、${displayName || cid} さんの規約説明を開始できませんでした（${st.mode === 'visit' ? 'knowledge-visit.md' : 'knowledge.md'} を確認してください）。`);
+    if (OPERATOR_ID) await pushToLine(OPERATOR_ID, `【要対応】規約ファイルが読み込めず、${displayName || cid} さんの規約説明を開始できませんでした（${courseTermsKind(st.mode) === 'visit' ? 'knowledge-visit.md' : 'knowledge.md'} を確認してください）。`);
     setOnb(cid, { ...st, stage: 'blocked' });
     return;
   }
@@ -783,38 +823,31 @@ async function answerTermsQuestion(cid, displayName, text) {
 
 async function startContract(cid, displayName) {
   const st = getOnb(cid);
-  // 出張費は月額。訪問の回数では変わらないので、初月分を初回のお支払いに含める
-  const visitFee = st.mode === 'visit' ? FEE_VISIT : 0;
-  const total = FEE_ENROLL + FEE_MONTHLY + visitFee;
-  const hasFees = FEE_ENROLL > 0 && FEE_MONTHLY > 0;
+  const c = findCourse(st.mode);
+  const isYearly = st.pay === 'yearly';
+  const amount = c ? Number((isYearly ? c.yearly : c.monthly) || 0) : 0;
+  const total = FEE_ENROLL + amount;
+  const hasFees = FEE_ENROLL > 0 && amount > 0;
   const lines = ['ご確認いただき、ありがとうございました。', '', 'お手続きについてご案内いたします。', ''];
   if (hasFees) {
     lines.push(
       `【${courseLabel(st.mode)}／初回のお支払い】（税込）`,
       '',
-      `・入会金　　　　${FEE_ENROLL.toLocaleString()}円`,
-      `・初月のお月謝　${FEE_MONTHLY.toLocaleString()}円`,
-      ...(visitFee > 0 ? [`・初月の出張費　${visitFee.toLocaleString()}円`] : []),
+      `・入会金　　　　　${FEE_ENROLL.toLocaleString()}円`,
+      isYearly
+        ? `・1年分の受講料　${amount.toLocaleString()}円`
+        : `・初月分の受講料　${amount.toLocaleString()}円`,
       '─────────',
-      `・合計　　　　　${total.toLocaleString()}円`,
+      `・合計　　　　　　${total.toLocaleString()}円`,
     );
   } else {
     // 料金の設定が読めなかった場合。誤った金額をお伝えするより、担当に引き継ぐ
     lines.push('初回のお支払いにつきましては、担当よりあらためてご案内いたします。');
-    console.warn('料金設定が読み込めていません（settings.json を確認してください）');
+    console.warn('料金設定が読み込めていません（settings.json の courses を確認してください）');
   }
-  if (st.mode === 'visit') {
-    lines.push(
-      '',
-      ...(visitFee > 0
-        ? [
-            `※ 出張費は月額${visitFee.toLocaleString()}円で、訪問の回数にかかわらず一律です。`,
-            '　レッスンの組み方が月によって変わっても、金額は変わりません。',
-          ]
-        : ['※ 出張費は別途頂戴いたします。']),
-      '※ 出張先の場所代は上記に含まれておりません。実際にかかった分をご負担いただきます。',
-    );
-  }
+  const perk = loadYearlyPerk();
+  if (isYearly && perk && c && !c.noPerk) lines.push('', `※ ${perk}`);
+  if (c && c.extraNote) lines.push('', `※ ${c.extraNote}`);
   lines.push('', 'お支払いは、ご本人名義のクレジットカードでお願いいたします。');
 
   if (PAYMENT_LINK_URL) {
@@ -839,7 +872,9 @@ async function startContract(cid, displayName) {
     displayName: displayName || '',
     mode: st.mode,
     course: courseLabel(st.mode),
-    termsFile: st.mode === 'visit' ? 'knowledge-visit.md' : 'knowledge.md',
+    payment: isYearly ? '年間まとめて' : '月々',
+    firstPayment: total,
+    termsFile: courseTermsKind(st.mode) === 'visit' ? 'knowledge-visit.md' : 'knowledge.md',
     agreedSections: sections.map((s) => s.title),
     agreedAt: new Date().toISOString(),
     startedAt: st.startedAt || '',
@@ -857,10 +892,11 @@ async function notifyOperatorRegistered(cid, displayName, st, total) {
     `お名前：${p.name || '(未入力)'}（${p.kana || ''}）`,
     `LINE表示名：${displayName || '(取得できず)'}`,
     `コース：${courseLabel(st.mode)}`,
+    `お支払い：${st.pay === 'yearly' ? '年間まとめて' : '月々'}`,
     `年齢：${p.age || ''}歳`,
     `メール：${p.email || ''}`,
   ];
-  if (st.mode === 'visit') lines.push(`電話：${p.phone || ''}`);
+  if (courseTermsKind(st.mode) === 'visit') lines.push(`電話：${p.phone || ''}`);
   lines.push(
     `楽器：${p.instrument || ''}`,
     `経験：${p.experience || ''}`,
@@ -868,8 +904,8 @@ async function notifyOperatorRegistered(cid, displayName, st, total) {
     '',
     `規約：${courseLabel(st.mode)}の全項目に同意済み`,
     total > 0
-      ? `案内した初回の支払い：${total.toLocaleString()}円${st.mode === 'visit' ? '（出張費・場所代は別途）' : ''}`
-      : '⚠️ 料金の設定が読めず、金額を案内できませんでした（settings.json を確認してください）',
+      ? `案内した初回の支払い：${total.toLocaleString()}円${findCourse(st.mode)?.extraNote ? '（場所代は別途）' : ''}`
+      : '⚠️ 料金の設定が読めず、金額を案内できませんでした（settings.json の courses を確認してください）',
     PAYMENT_LINK_URL ? '支払いリンクを送信済みです。' : '⚠️ 支払いリンクが未設定のため、金額のみご案内しました。お支払い方法の連絡が必要です。',
   );
   await pushToLine(OPERATOR_ID, lines.join('\n'));
@@ -882,9 +918,35 @@ async function handleOnbPostback(cid, displayName, onb, params) {
   if (!st) { await startOnboarding(cid, displayName); return; }
 
   if (onb === 'mode') {
-    const v = params.get('v') === 'visit' ? 'visit' : 'studio';
-    setOnb(cid, { ...st, mode: v, stage: 'profile', profileIdx: 0, profile: {} });
-    const msg = `${courseLabel(v)}でございますね。かしこまりました。\n\nそれでは、いくつかお伺いいたします。`;
+    const key = params.get('v');
+    const c = findCourse(key);
+    if (!c) return;
+    // 年間まとめてのみのコースは、お支払い方法の確認を挟まない
+    if (c.yearlyOnly) {
+      setOnb(cid, { ...st, mode: key, pay: 'yearly', stage: 'profile', profileIdx: 0, profile: {} });
+      const msg = [
+        `${c.name}でございますね。かしこまりました。`,
+        'こちらは年間まとめてのお支払いのみとさせていただいております。',
+        '',
+        'それでは、いくつかお伺いいたします。',
+      ].join('\n');
+      await pushToLine(cid, msg);
+      logConversation(cid, displayName, 'out', msg);
+      await askNextProfile(cid, displayName);
+      return;
+    }
+    setOnb(cid, { ...st, mode: key, stage: 'pay' });
+    const msg = `${c.name}でございますね。かしこまりました。`;
+    await pushToLine(cid, msg);
+    logConversation(cid, displayName, 'out', msg);
+    await sendPayPicker(cid, displayName);
+    return;
+  }
+  if (onb === 'pay') {
+    if (st.stage !== 'pay') return;
+    const pay = params.get('v') === 'yearly' ? 'yearly' : 'monthly';
+    setOnb(cid, { ...st, pay, stage: 'profile', profileIdx: 0, profile: {} });
+    const msg = 'ありがとうございます。\nそれでは、いくつかお伺いいたします。';
     await pushToLine(cid, msg);
     logConversation(cid, displayName, 'out', msg);
     await askNextProfile(cid, displayName);
